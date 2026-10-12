@@ -9,6 +9,12 @@ A fact is an edge ``subject --predicate--> value`` (a literal) or ``--predicate-
 Rows are append-only. A row's content and interval never change after it is written; the
 only update a row ever receives is its *end* (a status plus ``ended_at``), so the state of
 belief at any past moment can be reconstructed exactly.
+
+A fact a contact asserted in their own private scope is that contact's *claim* (it is what
+``ScopedMemory.remember`` writes for a contact). Claims get a timeline of their own within
+the same subject, predicate and scope: they supersede, correct and merge only with that
+contact's earlier claims, never with a fact anyone else recorded, and nobody else's writes
+end them. Otherwise a customer could overwrite what the owner recorded about them.
 """
 
 from __future__ import annotations
@@ -54,6 +60,12 @@ def private_scope(contact_id: str) -> str:
 
 def scope_audience(scope: str) -> str | None:
     return scope[len(_PRIVATE_PREFIX):] if scope.startswith(_PRIVATE_PREFIX) else None
+
+
+def claimant_of(scope: str, asserted_by: str) -> str | None:
+    """The contact whose own claim a fact is, or ``None`` when someone else recorded it."""
+    audience = scope_audience(scope)
+    return audience if audience is not None and asserted_by == audience else None
 
 
 def validate_scope(scope: str) -> str:
@@ -135,8 +147,15 @@ class Fact:
             raise ValueError("valid_to must be later than valid_from")
 
     @property
-    def key(self) -> tuple[str, str, str]:
-        return (self.subject, self.predicate, self.scope)
+    def claimant(self) -> str | None:
+        return claimant_of(self.scope, self.asserted_by)
+
+    @property
+    def key(self) -> tuple[str, str, str, str | None]:
+        """The timeline a row belongs to. Supersession, corrections owed and consolidation
+        never look beyond it, so a contact's claims and everyone else's facts about the
+        same thing stay independent."""
+        return (self.subject, self.predicate, self.scope, self.claimant)
 
     @property
     def believed(self) -> bool:

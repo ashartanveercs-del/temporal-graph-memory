@@ -6,8 +6,8 @@ this protocol and pass ``tests/test_store_contract.py``.
 
 SQLite layout: ``nodes`` + ``handles`` for entities and contacts, ``edges`` for facts (each
 with ``valid_from``/``valid_to`` and ``recorded_at``/``ended_at``), ``disclosures`` for the
-audience ledger, ``embeddings`` as a content-addressed vector cache, and an FTS5 index over
-each fact's text.
+audience ledger, ``embeddings`` as a content-addressed vector cache, ``purged`` for the ids
+of erased facts (tombstones, no values), and an FTS5 index over each fact's text.
 """
 
 from __future__ import annotations
@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS embeddings (
     UNIQUE (model, text_hash)
 );
 CREATE INDEX IF NOT EXISTS embeddings_seq ON embeddings(model, seq);
+CREATE TABLE IF NOT EXISTS purged (
+    id TEXT PRIMARY KEY
+);
 """
 
 _FTS_TABLE = (
@@ -141,9 +144,12 @@ class GraphStore(Protocol):
                  superseded_by: str | None = None) -> None: ...
     def set_fact_text(self, fact_id: str, text: str) -> None: ...
     def delete_fact(self, fact_id: str) -> None: ...
+    def add_purged(self, fact_ids: Sequence[str]) -> None: ...
+    def purged_ids(self) -> list[str]: ...
     def facts_version(self) -> int: ...
-    def fact_values(self) -> list[tuple[str, str, str | None, str | None]]: ...
+    def fact_values(self) -> list[tuple[str, str, str, str | None, str | None]]: ...
     def texts_with_phrase(self, tokens: Sequence[str], *, scopes: Sequence[str] | None,
+                          asserted_by: Sequence[str] | None = None,
                           limit: int = 50) -> list[str]: ...
     def query_facts(self, *, subject: str | None = None, predicate: str | None = None,
                     node: str | None = None, scopes: Sequence[str] | None = None,
@@ -180,30 +186,52 @@ class SQLiteGraphStore:
     write lock *before* reading: two deferred transactions that both read and then both try
     to write deadlock, and SQLite resolves that by failing one immediately, without waiting
     for the busy timeout.
+
+    ``readonly=True`` opens an existing file without changing anything in it (no schema
+    creation, no journal-mode switch); every write then fails. A rebuild uses it to look at
+    the database it is about to replace.
     """
 
     def __init__(self, path: str | Path, *, fts: bool | None = None,
-                 busy_timeout: float = 10.0) -> None:
+                 busy_timeout: float = 10.0, readonly: bool = False) -> None:
         self.path = str(path)
-        self._conn = sqlite3.connect(self.path, isolation_level=None, timeout=busy_timeout)
         self._depth = 0
-        if self.path != ":memory:":
-            self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute("PRAGMA synchronous = NORMAL")
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.executescript(_SCHEMA)
-        self.fts_enabled = self._setup_fts(fts)
+        if readonly:
+            uri = Path(path).resolve().as_uri() + "?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True, isolation_level=None,
+                                         timeout=busy_timeout)
+        else:
+            self._conn = sqlite3.connect(self.path, isolation_level=None,
+                                         timeout=busy_timeout)
+        try:  # a file that is not a database fails here; never leave it open (Windows locks)
+            if readonly:
+                self.fts_enabled = self._has_table("edges_fts")
+                self._has_purged = self._has_table("purged")
+                return
+            if self.path != ":memory:":
+                self._conn.execute("PRAGMA journal_mode = WAL")
+                self._conn.execute("PRAGMA synchronous = NORMAL")
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.executescript(_SCHEMA)
+            self._has_purged = True
+            self.fts_enabled = self._setup_fts(fts)
+        except BaseException:
+            self._conn.close()
+            raise
 
     # -- lifecycle ---------------------------------------------------------------------
 
     def close(self) -> None:
         self._conn.close()
 
+    def _has_table(self, name: str) -> bool:
+        return self._conn.execute("SELECT 1 FROM sqlite_master WHERE name = ?",
+                                  (name,)).fetchone() is not None
+
     def _setup_fts(self, requested: bool | None) -> bool:
         if requested is False:
             return False
-        exists = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE name = 'edges_fts'").fetchone() is not None
+        exists = self._has_table("edges_fts")
         try:
             self._conn.execute(_FTS_TABLE)
         except sqlite3.OperationalError:
@@ -365,6 +393,9 @@ class SQLiteGraphStore:
             fact.asserted_by, fact.status, _opt(fact.ended_at), fact.superseded_by,
             fact.derived_from, fact.source, fact.text, text_hash(fact.text))
         with self.transaction():
+            if self._conn.execute("SELECT 1 FROM purged WHERE id = ?",
+                                  (fact.id,)).fetchone() is not None:
+                raise ValueError(f"cannot store fact {fact.id!r}: that id was purged")
             try:
                 cursor = self._conn.execute(
                     f"INSERT INTO edges({_FACT_COLUMNS}, text_hash) "
@@ -410,6 +441,18 @@ class SQLiteGraphStore:
             self._conn.execute("DELETE FROM edges WHERE id = ?", (fact_id,))
             self._bump_facts_version()
 
+    def add_purged(self, fact_ids: Sequence[str]) -> None:
+        """Remember that these fact ids were erased, so they are never stored again (a
+        rebuild from an older vault leaves them out). Only ids are kept, never values."""
+        with self.transaction():
+            self._conn.executemany("INSERT OR IGNORE INTO purged(id) VALUES (?)",
+                                   [(fact_id,) for fact_id in fact_ids])
+
+    def purged_ids(self) -> list[str]:
+        if not self._has_purged:  # a read-only look at a file from before tombstones
+            return []
+        return [row[0] for row in self._conn.execute("SELECT id FROM purged ORDER BY id")]
+
     def query_facts(self, *, subject: str | None = None, predicate: str | None = None,
                     node: str | None = None, scopes: Sequence[str] | None = None,
                     statuses: Sequence[str] | None = None, valid_at: datetime | None = None,
@@ -438,25 +481,33 @@ class SQLiteGraphStore:
             sql += " WHERE " + " AND ".join(where)
         return [_fact(row) for row in self._conn.execute(f"{sql} {_ORDER}", params)]
 
-    def fact_values(self) -> list[tuple[str, str, str | None, str | None]]:
-        """``(id, scope, value, object)`` for every fact, without building ``Fact``s."""
-        return list(self._conn.execute("SELECT id, scope, value, object FROM edges ORDER BY id"))
+    def fact_values(self) -> list[tuple[str, str, str, str | None, str | None]]:
+        """``(id, subject, scope, value, object)`` for every fact, without building
+        ``Fact``s."""
+        return list(self._conn.execute(
+            "SELECT id, subject, scope, value, object FROM edges ORDER BY id"))
 
     def texts_with_phrase(self, tokens: Sequence[str], *, scopes: Sequence[str] | None,
+                          asserted_by: Sequence[str] | None = None,
                           limit: int = 50) -> list[str]:
-        """Texts of facts (any status) in ``scopes`` that contain all of ``tokens``,
-        as a phrase when FTS5 is available. Callers re-check exact word order."""
+        """Texts of facts (any status) in ``scopes``, and asserted by one of
+        ``asserted_by`` when given, that contain all of ``tokens``, as a phrase when FTS5 is
+        available. Callers re-check exact word order."""
         if not tokens:
             return []
         params: list[object] = []
-        scope_filter = f" AND {_in('e.scope', scopes, params)}" if scopes is not None else ""
+        filters = ""
+        if scopes is not None:
+            filters += f" AND {_in('e.scope', scopes, params)}"
+        if asserted_by is not None:
+            filters += f" AND {_in('e.asserted_by', asserted_by, params)}"
         if self.fts_enabled:
             phrase = '"' + " ".join(tokens) + '"'
             sql = ("SELECT e.text FROM edges_fts JOIN edges e ON e.seq = edges_fts.rowid "
-                   f"WHERE edges_fts MATCH ?{scope_filter} ORDER BY e.id LIMIT ?")
+                   f"WHERE edges_fts MATCH ?{filters} ORDER BY e.id LIMIT ?")
             return [row[0] for row in self._conn.execute(sql, [phrase, *params, limit])]
         likes = " AND ".join("e.text LIKE ? ESCAPE '\\'" for _ in tokens)
-        sql = f"SELECT e.text FROM edges e WHERE {likes}{scope_filter} ORDER BY e.id LIMIT ?"
+        sql = f"SELECT e.text FROM edges e WHERE {likes}{filters} ORDER BY e.id LIMIT ?"
         return [row[0] for row in self._conn.execute(
             sql, [*(like_pattern(t) for t in tokens), *params, limit])]
 

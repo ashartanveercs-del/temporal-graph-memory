@@ -2,6 +2,7 @@
 
 from datetime import timedelta
 
+import pytest
 from conftest import seed
 from fakes import T0, SwitchableEmbedder
 
@@ -54,6 +55,33 @@ def test_merge_threshold_is_configurable(mem):
     cream = mem.remember("priya", "note", "wants cream envelopes for the invitations")
     assert mem.consolidate().merged == []  # the default keeps conflicting notes apart
     assert mem.consolidate(merge_threshold=0.6).merged == [(cream.id, blue.id)]
+
+
+@pytest.mark.parametrize(("said", "negated"), [
+    ("Priya is allergic to latex gloves", "Priya is not allergic to latex gloves"),
+    ("Priya is allergic to latex gloves", "Priya isn't allergic to latex gloves"),
+    ("Priya is allergic to latex gloves", "Priya isn’t allergic to latex gloves"),
+    ("send the invoices by email", "never send the invoices by email"),
+    ("put the shop logo on the proofs", "put no shop logo on the proofs"),
+    ("deliver the flyers with the shop logo", "deliver the flyers without the shop logo"),
+    ("needs latex gloves for the fitting", "needs non-latex gloves for the fitting"),
+    ("needs latex gloves for the fitting", "needs latex-free gloves for the fitting"),
+    ("allergic to latex, not nitrile", "allergic to nitrile, not latex"),
+])
+def test_a_note_and_its_negation_are_never_merged(mem, clock, said, negated):
+    first = mem.remember("priya", "note", said)
+    clock.advance(DAY)
+    second = mem.remember("priya", "note", negated)
+    report = mem.consolidate()
+    assert report.merged == [] and report.duplicates == []
+    assert {f.id for f in mem.facts("priya", "note")} == {first.id, second.id}
+
+
+def test_exact_duplicates_of_a_negated_note_still_fold(mem, clock):
+    first = mem.remember("priya", "note", "No logo on the proofs.")
+    clock.advance(DAY)
+    second = mem.remember("priya", "note", "no logo on the proofs")
+    assert mem.consolidate().duplicates == [(second.id, first.id)]
 
 
 def test_single_valued_facts_are_never_merged(mem, clock):

@@ -9,7 +9,7 @@ from fakes import PRIYA, T0, SwitchableEmbedder
 
 from tgmem.embeddings import HashingEmbedder
 from tgmem.ids import SequentialIds
-from tgmem.memory import Memory
+from tgmem.memory import Memory, NotFound
 from tgmem.timeutil import ManualClock
 from tgmem.vault import VaultError, read_vault, rebuild_from_vault
 
@@ -72,7 +72,8 @@ def test_pages_have_a_stable_human_readable_format(tmp_path):
     assert (entities / "shop.md").read_text(encoding="utf-8") == SHOP_PAGE
     assert (entities / "priya.md").read_text(encoding="utf-8") == PRIYA_PAGE
     index = (tmp_path / "vault" / "index.md").read_text(encoding="utf-8")
-    assert index.startswith('---\ntgmem-vault: 1\npredicates: {}\n---\n')
+    assert re.match(r'---\ntgmem-vault: 1\npredicates: \{\}\n'
+                    r'db-digest: "sha256:[0-9a-f]{64}"\n---\n', index)
     assert "- [[priya]] Priya Shah (person)" in index
     memory.close()
 
@@ -184,6 +185,118 @@ def test_rebuild_refuses_to_drop_facts_missing_from_a_stale_vault(busy, tmp_path
     forced = Memory.open(path)
     assert forced.facts("shop", "fax") == []
     forced.close()
+
+
+def _hours(memory):
+    return memory.facts("shop", "opening_hours")[0].id
+
+
+AFTER_EXPORT = {
+    "retract": lambda m: m.retract(_hours(m)),
+    "correct": lambda m: m.correct(m.facts("mateo", "order")[0].id, "700 flyers due Monday"),
+    "contact": lambda m: m.add_contact("Lena Park", ["+1 555 000 0103"], id="lena"),
+    "disclosure": lambda m: m.record_disclosure("mateo", [_hours(m)]),
+    "rename": lambda m: m.upsert_entity("acme", "Acme Freight", kind="org"),
+    "predicate": lambda m: m.define_predicate("tags", "many"),
+}
+
+
+@pytest.mark.parametrize("change", sorted(AFTER_EXPORT))
+def test_rebuild_refuses_to_undo_changes_made_after_the_export(busy, tmp_path, change):
+    vault = tmp_path / "vault"
+    busy.export_vault(vault)
+    AFTER_EXPORT[change](busy)
+    path = busy.store.path
+    busy.close()
+    with pytest.raises(VaultError, match="not in the vault"):
+        rebuild_from_vault(vault, path)
+
+
+def test_a_forced_rebuild_never_brings_back_a_purged_fact(busy, tmp_path):
+    vault = tmp_path / "vault"
+    budget = busy.remember("priya", "budget", "$480 for wedding invitations")
+    busy.export_vault(vault)
+    busy.retract(_hours(busy))
+    busy.add_contact("Lena Park", ["+1 555 000 0103"], id="lena")
+    busy.purge(budget.id)
+    path = busy.store.path
+    busy.close()
+    with pytest.raises(VaultError, match="not in the vault"):
+        rebuild_from_vault(vault, path)
+    report = rebuild_from_vault(vault, path, force=True)  # discards the retraction and Lena,
+    assert report.purged_left_out == 1
+    forced = Memory.open(path)
+    assert forced.facts("priya", "budget") == []  # but never an erasure
+    with pytest.raises(NotFound):
+        forced.fact(budget.id)
+    forced.close()
+
+
+def test_a_purge_after_the_export_survives_a_rebuild_without_force(busy, tmp_path):
+    vault = tmp_path / "vault"
+    budget = busy.remember("priya", "budget", "$480 for wedding invitations")
+    busy.export_vault(vault)
+    busy.purge(budget.id)
+    path = busy.store.path
+    busy.close()
+    rebuild_from_vault(vault, path)  # nothing the database holds would be lost
+    rebuilt = Memory.open(path)
+    assert rebuilt.facts("priya", "budget") == []
+    assert rebuilt.store.purged_ids() == [budget.id]
+    rebuilt.close()
+
+
+def test_purged_ids_are_exported_and_honoured_by_later_rebuilds(busy, tmp_path):
+    budget = busy.remember("priya", "budget", "$480 for wedding invitations")
+    busy.export_vault(tmp_path / "before")
+    busy.purge(budget.id)
+    busy.export_vault(tmp_path / "after")
+    index = (tmp_path / "after" / "index.md").read_text(encoding="utf-8")
+    assert f'purged: ["{budget.id}"]' in index
+    assert not any("$480" in page.read_text(encoding="utf-8")
+                   for page in (tmp_path / "after").rglob("*.md"))
+    rebuild_from_vault(tmp_path / "after", tmp_path / "copy.db")
+    # The copy inherited the tombstone, so even a forced rebuild from the older vault
+    # leaves the erased value out.
+    report = rebuild_from_vault(tmp_path / "before", tmp_path / "copy.db", force=True)
+    assert report.purged_left_out == 1
+    copy = Memory.open(tmp_path / "copy.db")
+    assert copy.facts("priya", "budget") == []
+    copy.close()
+
+
+def test_a_vault_cannot_keep_a_fact_it_lists_as_purged(busy, tmp_path):
+    vault = tmp_path / "vault"
+    busy.export_vault(vault)
+    [order] = busy.facts("mateo", "order")
+    index = vault / "index.md"
+    text = index.read_text(encoding="utf-8").replace(
+        "\n---\n", f'\npurged: ["{order.id}"]\n---\n', 1)
+    index.write_text(text, encoding="utf-8", newline="\n")
+    with pytest.raises(VaultError, match="purged"):
+        read_vault(vault)
+
+
+def test_hand_edits_rebuild_in_place_while_the_database_is_unchanged(busy, tmp_path):
+    vault = tmp_path / "vault"
+    busy.export_vault(vault)
+    busy.consolidate()  # finds nothing to do, so the database content is unchanged
+    corrupt(vault, "mateo.md", "500 flyers", "600 flyers")
+    path = busy.store.path
+    busy.close()
+    rebuild_from_vault(vault, path)  # no force needed: only the vault was edited
+    edited = Memory.open(path)
+    [order] = edited.facts("mateo", "order")
+    assert order.value.startswith("600 flyers")
+    edited.close()
+
+
+def test_an_empty_database_is_rebuilt_without_force(busy, tmp_path):
+    busy.export_vault(tmp_path / "vault")
+    Memory.open(tmp_path / "fresh.db").close()  # e.g. `tgmem init` on a new machine
+    report = rebuild_from_vault(tmp_path / "vault", tmp_path / "fresh.db")
+    assert report.facts == len(busy.history("shop") + busy.history("priya")
+                               + busy.history("mateo"))
 
 
 def test_rebuild_keeps_cached_embeddings(tmp_path):

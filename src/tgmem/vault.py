@@ -3,7 +3,8 @@
 Layout::
 
     vault/
-      index.md               format version, predicate definitions, list of pages
+      index.md               format version, predicate definitions, purged fact ids,
+                             fingerprint of the exported database, list of pages
       entities/<node-id>.md  one page per node
 
 A page is JSON-valued front matter (valid YAML, so Obsidian shows it as properties)
@@ -19,17 +20,27 @@ canonical timestamps, ``\\n`` line endings on every OS. Exporting twice writes n
 second time, and export -> rebuild -> export reproduces the vault byte for byte. Parsing
 is strict and reports ``file:line`` for anything it does not understand, because a vault
 that silently loses a fact is worse than one that refuses to load.
+
+A rebuild replaces the database, so it must not quietly undo work done after the export.
+``index.md`` carries ``db-digest``, a SHA-256 over the canonical rendering of everything the
+database held at export time. If the database still matches it, every difference comes
+from editing the vault and the rebuild goes ahead. Otherwise the rebuild refuses (unless
+forced) as soon as the database holds anything the vault lacks or shows differently: a
+retraction, a new contact, a disclosure, a renamed node. Purged fact ids are kept as
+tombstones in both places, and every rebuild, forced or not, leaves them out, so an older
+vault cannot bring an erased value back into a database that recorded the purge.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
 from collections import defaultdict
-from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -63,6 +74,7 @@ _TOLD_LINE = re.compile(
     r"\{(?P<meta>[^{}]*)\}  \^(?P<id>d-[0-9a-z]+)$")
 _OBJECT = re.compile(r"^\[\[(?P<node>[a-z0-9]+(?:-[a-z0-9]+)*)\]\]$")
 _TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,63}$")
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SECTIONS = {"## Facts": "facts", "## History": "history", "## Told": "told"}
 _ESCAPES = {"\\": "\\", "n": "\n", "r": "\r", "t": "\t", "[": "["}
 
@@ -88,6 +100,8 @@ class VaultData:
     facts: list[Fact]
     disclosures: list[Disclosure]
     predicates: dict[str, str]
+    purged: list[str] = field(default_factory=list)  # tombstones: ids of erased facts
+    digest: str | None = None  # db-digest from index.md: the database it was exported from
 
 
 @dataclass(frozen=True)
@@ -96,6 +110,7 @@ class RebuildReport:
     facts: int
     disclosures: int
     embeddings_kept: int  # cached vectors carried over from the previous database
+    purged_left_out: int = 0  # vault facts dropped because their ids were purged
 
 
 # -- export --------------------------------------------------------------------------------
@@ -103,16 +118,10 @@ class RebuildReport:
 def export_vault(store: GraphStore, directory: str | Path) -> ExportReport:
     root = Path(directory)
     (root / "entities").mkdir(parents=True, exist_ok=True)
-    nodes = store.nodes()
-    facts_by_subject: dict[str, list[Fact]] = defaultdict(list)
-    facts_by_id: dict[str, Fact] = {}
-    for fact in store.query_facts():
-        facts_by_subject[fact.subject].append(fact)
-        facts_by_id[fact.id] = fact
-    pages = {"index.md": render_index(nodes, store.predicates())}
-    for node in nodes:
-        told = [(d, facts_by_id[d.fact_id]) for d in store.disclosures(contact=node.id)]
-        pages[f"entities/{node.id}.md"] = render_page(node, facts_by_subject[node.id], told)
+    nodes, predicates, purged = store.nodes(), store.predicates(), store.purged_ids()
+    pages = render_pages(nodes, store.query_facts(), store.disclosures())
+    digest = content_digest(pages, predicates, purged)
+    pages["index.md"] = render_index(nodes, predicates, purged=purged, digest=digest)
 
     written, unchanged = [], 0
     for relative, content in pages.items():
@@ -132,11 +141,40 @@ def export_vault(store: GraphStore, directory: str | Path) -> ExportReport:
     return ExportReport(written, unchanged, removed)
 
 
-def render_index(nodes: Iterable[Node], predicates: dict[str, str]) -> str:
-    lines = [
-        "---",
-        f"tgmem-vault: {FORMAT_VERSION}",
-        f"predicates: {json.dumps(predicates, sort_keys=True)}",
+def render_pages(nodes: Iterable[Node], facts: Iterable[Fact],
+                 disclosures: Iterable[Disclosure]) -> dict[str, str]:
+    """Every entity page, keyed by vault-relative path."""
+    facts_by_subject: dict[str, list[Fact]] = defaultdict(list)
+    facts_by_id: dict[str, Fact] = {}
+    for fact in facts:
+        facts_by_subject[fact.subject].append(fact)
+        facts_by_id[fact.id] = fact
+    told: dict[str, list[tuple[Disclosure, Fact]]] = defaultdict(list)
+    for disclosure in disclosures:
+        told[disclosure.contact].append((disclosure, facts_by_id[disclosure.fact_id]))
+    return {f"entities/{node.id}.md": render_page(node, facts_by_subject[node.id], told[node.id])
+            for node in nodes}
+
+
+def content_digest(pages: dict[str, str], predicates: dict[str, str],
+                   purged: Sequence[str]) -> str:
+    """Fingerprint of everything a vault holds apart from the fingerprint itself."""
+    digest = hashlib.sha256(json.dumps([predicates, sorted(purged)], sort_keys=True).encode())
+    for path in sorted(pages):
+        page = hashlib.sha256(pages[path].encode("utf-8")).hexdigest()
+        digest.update(f"\n{path} {page}".encode())
+    return "sha256:" + digest.hexdigest()
+
+
+def render_index(nodes: Iterable[Node], predicates: dict[str, str], *,
+                 purged: Sequence[str] = (), digest: str | None = None) -> str:
+    lines = ["---", f"tgmem-vault: {FORMAT_VERSION}",
+             f"predicates: {json.dumps(predicates, sort_keys=True)}"]
+    if purged:
+        lines.append(f"purged: {json.dumps(sorted(purged))}")
+    if digest:
+        lines.append(f"db-digest: {json.dumps(digest)}")
+    lines += [
         "---",
         "",
         "# Memory vault",
@@ -145,7 +183,10 @@ def render_index(nodes: Iterable[Node], predicates: dict[str, str]) -> str:
         "from (`tgmem vault rebuild`). Each page in `entities/` is one node. Each line under",
         "**Facts** or **History** is one fact; **Told** lists what a contact has been told.",
         "Pages are regenerated on every export: change memory through the API or CLI, or",
-        "edit fact lines here and rebuild.",
+        "edit fact lines here and rebuild. `db-digest` fingerprints the database this vault",
+        "was exported from: a rebuild refuses to replace a database that has changed since,",
+        "unless forced. `purged` lists the ids (never the values) of erased facts, which",
+        "every rebuild leaves out.",
         "",
         "## Entities",
         "",
@@ -243,6 +284,13 @@ def read_vault(directory: str | Path) -> VaultData:
     if not isinstance(predicates, dict) or any(
             not isinstance(k, str) or v not in (ONE, MANY) for k, v in predicates.items()):
         raise VaultError("predicates must map names to \"one\" or \"many\"", path="index.md")
+    purged = front.get("purged", [])
+    if not isinstance(purged, list) or not all(
+            isinstance(p, str) and re.fullmatch(_FACT_ID, p) for p in purged):
+        raise VaultError("purged must be a list of fact ids", path="index.md")
+    digest = front.get("db-digest")
+    if digest is not None and not (isinstance(digest, str) and _DIGEST.match(digest)):
+        raise VaultError("db-digest must look like \"sha256:<64 hex digits>\"", path="index.md")
 
     nodes: list[Node] = []
     facts: list[tuple[Fact, str, int]] = []
@@ -256,8 +304,9 @@ def read_vault(directory: str | Path) -> VaultData:
         nodes.append(node)
         facts += page_facts
         told += page_told
-    _validate(nodes, facts, told, predicates)
-    return VaultData(nodes, [f for f, _, _ in facts], [d for d, *_ in told], dict(predicates))
+    _validate(nodes, facts, told, predicates, purged)
+    return VaultData(nodes, [f for f, _, _ in facts], [d for d, *_ in told], dict(predicates),
+                     sorted(set(purged)), digest)
 
 
 def _lines(path: Path) -> list[str]:
@@ -436,7 +485,7 @@ def _unescape(text: str, path: str, number: int) -> str:
 
 def _validate(nodes: list[Node], facts: list[tuple[Fact, str, int]],
               told: list[tuple[Disclosure, str, str, str, int]],
-              predicates: dict[str, str]) -> None:
+              predicates: dict[str, str], purged: list[str]) -> None:
     by_node = {n.id: n for n in nodes}
     handle_owner: dict[str, str] = {}
     for node in nodes:
@@ -447,9 +496,13 @@ def _validate(nodes: list[Node], facts: list[tuple[Fact, str, int]],
             handle_owner[handle] = node.id
 
     by_fact: dict[str, Fact] = {}
+    erased = set(purged)
     for fact, path, number in facts:
         if fact.id in by_fact:
             raise VaultError(f"duplicate fact id {fact.id!r}", path=path, line=number)
+        if fact.id in erased:
+            raise VaultError(f"{fact.id} is listed as purged in index.md but still has a line",
+                             path=path, line=number)
         by_fact[fact.id] = fact
     for fact, path, number in facts:
         if fact.object is not None and fact.object not in by_node:
@@ -507,18 +560,18 @@ def rebuild_from_vault(vault_dir: str | Path, db_path: str | Path, *, force: boo
     built next to the old one and swapped in with an atomic rename, together with its
     WAL sidecar files (a stale ``-wal`` file next to a new database would be replayed
     into it). Cached embeddings are carried over when the old file is readable, so a
-    rebuild does not pay to embed unchanged text again. If the old database holds facts
-    the vault does not, the rebuild refuses unless ``force=True``.
+    rebuild does not pay to embed unchanged text again.
+
+    Unless ``force=True``, the rebuild refuses when the old database has changed since the
+    vault was exported and holds anything the vault lacks or shows differently (see the
+    module docstring). Facts purged from either side are always left out.
     """
     data = read_vault(vault_dir)
     target = Path(db_path)
-    existing = _read_old(target, "SELECT id FROM edges")
-    if existing is not None and not force:
-        missing = {row[0] for row in existing} - {f.id for f in data.facts}
-        if missing:
-            raise VaultError(f"{len(missing)} fact(s) in the database are not in the vault "
-                             f"(for example {sorted(missing)[0]}); export first, or rebuild "
-                             "with force=True to discard them")
+    old = _read_database(target)
+    data, left_out = _without_purged(data, data.purged + (old.purged if old else []))
+    if old is not None and not force:
+        _refuse_to_lose(old, data)
     staging = target.with_name(target.name + ".rebuild")
     _remove_database(staging)
     store = SQLiteGraphStore(staging, fts=fts)
@@ -526,6 +579,7 @@ def rebuild_from_vault(vault_dir: str | Path, db_path: str | Path, *, force: boo
         nodes = {n.id: n for n in data.nodes}
         with store.transaction():
             store.defer_foreign_keys()
+            store.add_purged(data.purged)
             for name, cardinality in sorted(data.predicates.items()):
                 store.put_predicate(name, cardinality)
             for node in sorted(data.nodes, key=lambda n: n.id):
@@ -546,7 +600,60 @@ def rebuild_from_vault(vault_dir: str | Path, db_path: str | Path, *, force: boo
         store.close()
     _remove_database(target)
     os.replace(staging, target)
-    return RebuildReport(len(data.nodes), len(data.facts), len(data.disclosures), kept)
+    return RebuildReport(len(data.nodes), len(data.facts), len(data.disclosures), kept,
+                         left_out)
+
+
+def _read_database(path: Path) -> VaultData | None:
+    """What the database at ``path`` holds, in vault terms; None if missing or unreadable
+    (then there is nothing a rebuild could protect). Opened read-only."""
+    if not path.exists():
+        return None
+    try:
+        store = SQLiteGraphStore(path, readonly=True)
+    except sqlite3.DatabaseError:
+        return None
+    try:
+        return VaultData(store.nodes(), store.query_facts(), store.disclosures(),
+                         store.predicates(), store.purged_ids())
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        store.close()
+
+
+def _without_purged(data: VaultData, purged: Iterable[str]) -> tuple[VaultData, int]:
+    """``data`` minus purged facts and their disclosures, with references to them cleared,
+    which is exactly what purging did to the database (``ON DELETE SET NULL / CASCADE``)."""
+    gone = set(purged)
+    kept = [f for f in data.facts if f.id not in gone]
+    left_out = len(data.facts) - len(kept)
+    kept = [replace(f, superseded_by=None if f.superseded_by in gone else f.superseded_by,
+                    derived_from=None if f.derived_from in gone else f.derived_from)
+            for f in kept]
+    told = [d for d in data.disclosures if d.fact_id not in gone]
+    return replace(data, facts=kept, disclosures=told, purged=sorted(gone)), left_out
+
+
+def _refuse_to_lose(old: VaultData, data: VaultData) -> None:
+    if data.digest is not None and data.digest == content_digest(
+            render_pages(old.nodes, old.facts, old.disclosures), old.predicates, old.purged):
+        return  # unchanged since the export, so every difference is an edit to the vault
+    facts = {f.id: f for f in data.facts}
+    nodes = {n.id: n for n in data.nodes}
+    told = {d.id: d for d in data.disclosures}
+    lost = {
+        "fact": [f.id for f in old.facts if facts.get(f.id) != replace(f, text="")],
+        "node": [n.id for n in old.nodes if nodes.get(n.id) != n],
+        "disclosure": [d.id for d in old.disclosures if told.get(d.id) != d],
+        "predicate": sorted(p for p, c in old.predicates.items() if data.predicates.get(p) != c),
+    }
+    found = [f"{len(ids)} {kind}{'' if len(ids) == 1 else 's'} (e.g. {ids[0]})"
+             for kind, ids in lost.items() if ids]
+    if found:
+        raise VaultError("the database has changes that are not in the vault, which a "
+                         f"rebuild would undo: {', '.join(found)}; export first, or rebuild "
+                         "with force=True to discard them")
 
 
 def _read_old(path: Path, sql: str) -> list[tuple] | None:

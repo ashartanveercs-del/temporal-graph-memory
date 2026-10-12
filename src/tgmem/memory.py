@@ -12,6 +12,11 @@ are re-recorded as *remainder* rows carrying X's value:
 
 Rows are never edited apart from being ended once, which is what lets ``known_at`` queries
 reconstruct exactly what the memory believed at any earlier moment.
+
+"For the same key" means the same timeline (``Fact.key``): a contact's own claims form a
+timeline separate from the facts the owner recorded, even facts about that contact. A
+customer who says "my credit limit is $50,000", backdated or not, adds a claim attributed to
+them; the owner's "$500 net 30" stays active and the owner settles the claim by retracting it.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ from .model import (
     Fact,
     Node,
     Viewer,
+    claimant_of,
     normalize_predicate,
     normalize_value,
     private_scope,
@@ -267,7 +273,8 @@ class Memory:
 
         Without ``scope``, facts about a contact are private to that contact and other
         facts are public. For single-valued predicates the new fact supersedes whatever it
-        overlaps (see the module docstring); repeating a value already in force is a no-op.
+        overlaps on its own timeline (see the module docstring); repeating a value already
+        in force there is a no-op.
         """
         predicate = normalize_predicate(predicate)
         value = normalize_value(value) if value is not None else None
@@ -288,8 +295,10 @@ class Memory:
                 start + ttl if ttl is not None else None)
             if end is not None and end <= start:
                 raise ValueError("valid_to must be later than valid_from")
-            current = self.store.query_facts(subject=subject, predicate=predicate,
-                                             scopes=[scope], statuses=BELIEVED)
+            claimant = claimant_of(scope, asserted_by)
+            current = [f for f in self.store.query_facts(subject=subject, predicate=predicate,
+                                                         scopes=[scope], statuses=BELIEVED)
+                       if f.claimant == claimant]
             for existing in current:
                 if (existing.value, existing.object) == (value, object) and _covers(
                         existing, start, end):
@@ -307,7 +316,12 @@ class Memory:
                 valid_from: datetime | None = None, asserted_by: str = "owner",
                 source: str | None = None) -> Fact:
         """Replace a fact's value. By default the replacement covers the fact's whole
-        interval (it was wrong); with a later ``valid_from`` it is a change from then on."""
+        interval (it was wrong); with a later ``valid_from`` it is a change from then on.
+
+        A correction stays on the timeline of the fact it corrects: a contact's claim is
+        corrected only as that contact, and nobody corrects the owner's facts on a
+        contact's behalf. To overrule a claim, retract it and ``remember`` your own value.
+        """
         value = normalize_value(value) if value is not None else None
         if (value is None) == (object is None):
             raise ValueError("pass exactly one of value or object")
@@ -315,6 +329,14 @@ class Memory:
         source = _tag(source, "source") if source is not None else None
         with self.store.transaction():
             old = self._believed(fact_id)
+            if claimant_of(old.scope, asserted_by) != old.claimant:
+                if old.claimant is not None:
+                    raise ValueError(
+                        f"{fact_id!r} is {old.claimant!r}'s claim: correct it as them "
+                        f"(asserted_by={old.claimant!r}), or retract it and remember your "
+                        "own value")
+                raise ValueError(f"{asserted_by!r} cannot correct {fact_id!r}: in "
+                                 f"{old.scope} that would turn it into their own claim")
             if object is not None:
                 self.node(object)
             now = self.store.next_tx_time(self.clock.now())
@@ -329,7 +351,7 @@ class Memory:
             else:
                 current = self.store.query_facts(subject=old.subject, predicate=old.predicate,
                                                  scopes=[old.scope], statuses=BELIEVED)
-                targets = [f for f in current if _overlaps(f, start, end)]
+                targets = [f for f in current if f.key == old.key and _overlaps(f, start, end)]
             fact = self._new_fact(old.subject, old.predicate, value, object, old.scope, start,
                                   end, now, asserted_by, source)
             self.store.insert_fact(fact)
@@ -348,7 +370,11 @@ class Memory:
     def purge(self, fact_id: str) -> list[str]:
         """Erase a value completely: the fact, every row derived from the same assertion,
         their disclosures, and cached embeddings no other fact uses. Unlike ``retract``
-        this destroys history; use it for erasure requests."""
+        this destroys history; use it for erasure requests.
+
+        The erased ids (never the values) are kept as tombstones: the vault lists them and
+        every rebuild leaves them out, so rebuilding this database from an older vault
+        cannot bring the value back."""
         with self.store.transaction():
             start = self.fact(fact_id)
             family = {f.id: f for f in self.store.query_facts(
@@ -371,6 +397,7 @@ class Memory:
             hashes = {text_hash(family[i].text) for i in lineage}
             for purged in sorted(lineage):
                 self.store.delete_fact(purged)
+            self.store.add_purged(sorted(lineage))
             unused = {digest for digest in hashes if not self.store.hash_in_use(digest)}
             for digest in unused:
                 self.store.delete_embeddings(digest)

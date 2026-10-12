@@ -10,9 +10,15 @@ interesting questions answerable:
 * Leaks: does an outgoing reply contain a distinctive value from a fact the recipient
   is not allowed to see?
 
-Mention and leak detection are deterministic token matching, deliberately conservative:
-a value is only matched when it is distinctive (several words, a long word, or a number
-with three or more digits), so short generic values never trigger false alarms.
+Mention and leak detection are deterministic token matching. A reply *mentions* a fact
+when it contains the value's opening phrase (several words, or one long word) or one of
+its numbers of three or more digits. The leak guard is stricter, because a missed leak
+costs more than a cautious fallback reply. It also matches any three-word run of a hidden
+value that holds at least two strong words (not stopwords, three or more characters), and,
+for a fact about a person, two adjacent strong words of the value when the reply also names
+that person: "Priya lives on Elm Street" leaks "12 Elm Street Springfield". Short generic
+runs ("by June 1") are never matched, and a phrase the recipient can legitimately know
+from a public fact, or from one the owner recorded for them, is not a leak.
 """
 
 from __future__ import annotations
@@ -30,13 +36,15 @@ from .model import (
     EXPIRED,
     MERGED,
     ONE,
+    PUBLIC,
     RETRACTED,
     SUPERSEDED,
     Disclosure,
     Fact,
+    Node,
     Viewer,
 )
-from .textindex import tokenize
+from .textindex import STOPWORDS, tokenize
 from .timeutil import to_text
 
 if TYPE_CHECKING:
@@ -44,6 +52,10 @@ if TYPE_CHECKING:
 
 _NUMBER = re.compile(r"\d{3,}")
 _YEAR = re.compile(r"^(19|20)\d\d$")
+
+# ``asserted_by`` values that speak for the owner. Any node with role "owner" does too;
+# everything else (a contact's id, an integration's tag) is somebody's claim.
+OWNER_TAGS = frozenset({"owner", "system", "import"})
 
 
 @dataclass(frozen=True)
@@ -116,8 +128,9 @@ def corrections_owed(memory: Memory, contact: str) -> list[Correction]:
     for disclosure, told in latest_per_key.values():
         if told.status in (ACTIVE, EXPIRED) and not told.valid_at(now):
             continue  # it lapsed on schedule (a promo ended); nothing was wrong
-        current = memory.store.query_facts(subject=told.subject, predicate=told.predicate,
-                                           scopes=[told.scope], statuses=BELIEVED, valid_at=now)
+        current = [f for f in memory.store.query_facts(
+            subject=told.subject, predicate=told.predicate, scopes=[told.scope],
+            statuses=BELIEVED, valid_at=now) if f.key == told.key]
         if not current:
             if told.status in (CORRECTED, RETRACTED):
                 owed.append(Correction(told, disclosure.told_at, None, told.status))
@@ -161,14 +174,50 @@ MAX_PHRASE = 32  # long values are matched by their first 32 words
 def secrets_of(text: str) -> list[tuple[str, ...]]:
     """Token sequences that would reveal a value if they appeared in a reply: the value's
     opening phrase (when distinctive) and each number of three or more digits."""
-    words = tuple(tokenize(text))
+    return _secrets(tuple(tokenize(text)))
+
+
+def _secrets(words: tuple[str, ...]) -> list[tuple[str, ...]]:
     found: list[tuple[str, ...]] = []
     if len(words) >= 2 or (len(words) == 1 and len(words[0]) >= 8):
         found.append(words[:MAX_PHRASE])
     for word in words:
-        if _NUMBER.search(word) and not _YEAR.match(word) and (word,) not in found:
+        if (len(word) >= 3 and _NUMBER.search(word) and not _YEAR.match(word)
+                and (word,) not in found):
             found.append((word,))
     return found
+
+
+def _strong(word: str) -> bool:
+    """A word that carries information on its own: not a stopword, three or more chars."""
+    return len(word) >= 3 and word not in STOPWORDS
+
+
+def guard_phrases(text: str) -> tuple[list[tuple[str, ...]], list[tuple[str, ...]]]:
+    """What the leak guard looks for in a reply, from a value's first 32 words:
+
+    * phrases: the opening phrase and numbers (as ``secrets_of``), plus every three-word
+      run holding at least two strong words ("for wedding invitations" from "$480 for
+      wedding invitations", but not "by june 1" from "needed by June 1");
+    * pairs: two adjacent strong words ("elm street"), which only count when the reply
+      also names the person the fact is about.
+    """
+    words = tuple(tokenize(text))
+    head = words[:MAX_PHRASE]
+    strong = [len(word) >= 3 and word not in STOPWORDS for word in head]  # _strong, inlined
+    runs = [head[i:i + 3] for i in range(len(head) - 2)
+            if strong[i] + strong[i + 1] + strong[i + 2] >= 2]
+    pairs = [head[i:i + 2] for i in range(len(head) - 1) if strong[i] and strong[i + 1]]
+    return list(dict.fromkeys(_secrets(words) + runs)), list(dict.fromkeys(pairs))
+
+
+def _name_words(node: Node) -> set[str]:
+    """Words that refer to a person on their own: "priya" or "shah" for "Priya Shah"."""
+    return {w for name in (node.name, *node.aliases) for w in tokenize(name) if _strong(w)}
+
+
+def _is_person(node: Node) -> bool:
+    return node.kind == "person" or node.is_contact
 
 
 def _contains(haystack: list[str], needle: tuple[str, ...]) -> bool:
@@ -184,45 +233,73 @@ def mentions(memory: Memory, text: str, facts: list[Fact]) -> list[Fact]:
 
 
 class SecretIndex:
-    """Phrase -> facts index over every fact's value, rebuilt only when facts or node names
-    change (in any process). A reply is then checked by looking up its word n-grams, which
-    costs the same whether the memory holds a hundred facts or a hundred thousand."""
+    """Phrase -> facts index over the values of every fact that is not public, rebuilt
+    only when facts or nodes change (in any process). A reply is then checked by looking
+    up its word n-grams, which costs the same whether the memory holds a hundred facts or a
+    hundred thousand."""
 
     def __init__(self) -> None:
         self._version: tuple[int, int] | None = None
         self._by_phrase: dict[tuple[str, ...], list[tuple[str, str]]] = {}
+        self._by_pair: dict[tuple[str, ...], list[tuple[str, str, str]]] = {}
+        self._people_by_word: dict[str, set[str]] = {}
         self._longest = 0
+        self.trusted: frozenset[str] = OWNER_TAGS  # authors whose text the viewer may know
 
     def refresh(self, memory: Memory) -> None:
         version = (memory.store.facts_version(), memory.store.nodes_version())
         if version == self._version:
             return
-        names = {node.id: node.name for node in memory.store.nodes()}
+        nodes = {node.id: node for node in memory.store.nodes()}
         by_phrase: dict[tuple[str, ...], list[tuple[str, str]]] = {}
-        for fact_id, scope, value, obj in memory.store.fact_values():
-            text = value if value is not None else names.get(obj or "", "")
-            for secret in secrets_of(text):
-                by_phrase.setdefault(secret, []).append((fact_id, scope))
-        self._by_phrase = by_phrase
+        by_pair: dict[tuple[str, ...], list[tuple[str, str, str]]] = {}
+        people: set[str] = set()
+        for fact_id, subject, scope, value, obj in memory.store.fact_values():
+            if scope == PUBLIC:
+                continue  # every viewer may see it, so it can never leak
+            text = value if value is not None else (nodes[obj].name if obj in nodes else "")
+            phrases, pairs = guard_phrases(text)
+            for phrase in phrases:
+                by_phrase.setdefault(phrase, []).append((fact_id, scope))
+            if subject in nodes and _is_person(nodes[subject]):
+                people.add(subject)
+                for pair in pairs:
+                    by_pair.setdefault(pair, []).append((fact_id, scope, subject))
+        people_by_word: dict[str, set[str]] = {}
+        for person in people:
+            for word in _name_words(nodes[person]):
+                people_by_word.setdefault(word, set()).add(person)
+        self._by_phrase, self._by_pair = by_phrase, by_pair
+        self._people_by_word = people_by_word
         self._longest = max((len(p) for p in by_phrase), default=0)
+        self.trusted = OWNER_TAGS | {n.id for n in nodes.values() if n.role == "owner"}
         self._version = version
 
     def hits(self, tokens: list[str]) -> dict[tuple[str, ...], list[tuple[str, str]]]:
+        """Phrase -> ``(fact id, scope)`` for every indexed phrase found in ``tokens``."""
         found: dict[tuple[str, ...], list[tuple[str, str]]] = {}
         for i in range(len(tokens)):
             for n in range(1, min(self._longest, len(tokens) - i) + 1):
                 phrase = tuple(tokens[i:i + n])
                 if phrase in self._by_phrase:
-                    found[phrase] = self._by_phrase[phrase]
+                    found[phrase] = list(self._by_phrase[phrase])
+        named = set().union(*(self._people_by_word.get(t, ()) for t in set(tokens)))
+        if named:
+            for pair in zip(tokens, tokens[1:], strict=False):
+                for fact_id, scope, person in self._by_pair.get(pair, ()):
+                    if person in named:
+                        found.setdefault(pair, []).append((fact_id, scope))
         return found
 
 
 def leaks(memory: Memory, viewer: Viewer, text: str,
           index: SecretIndex | None = None) -> list[Fact]:
-    """Facts ``viewer`` may not see whose distinctive values appear in ``text``.
+    """Facts ``viewer`` may not see whose values show up in ``text`` (see the module
+    docstring for what counts as showing up).
 
-    A phrase the viewer can legitimately know (because a fact visible to them contains
-    it) is not a leak, even if a hidden fact contains it too.
+    A phrase is not a leak when the viewer can legitimately know it: it appears in a
+    public fact, or in a fact the owner recorded in one of the viewer's scopes. Text the
+    viewer wrote never counts, or anyone could whitelist a secret by saving it first.
     """
     if viewer.scopes() is None:
         return []
@@ -231,15 +308,27 @@ def leaks(memory: Memory, viewer: Viewer, text: str,
     leaked: list[str] = []
     for phrase, owners in index.hits(tokenize(text)).items():
         hidden = [fid for fid, scope in owners if not viewer.can_see(scope)]
-        if not hidden or _visible_elsewhere(memory, viewer, phrase):
+        if not hidden or _known_to(memory, viewer, phrase, index.trusted):
             continue
         leaked += [fid for fid in hidden if fid not in leaked]
     return memory.store.query_facts(ids=leaked) if leaked else []
 
 
-def _visible_elsewhere(memory: Memory, viewer: Viewer, phrase: tuple[str, ...]) -> bool:
-    candidates = memory.store.texts_with_phrase(list(phrase), scopes=viewer.scopes())
-    return any(_contains(tokenize(text), phrase) for text in candidates)
+def _known_to(memory: Memory, viewer: Viewer, phrase: tuple[str, ...],
+              trusted: frozenset[str]) -> bool:
+    scopes = viewer.scopes() or ()
+    lookups: list[tuple[list[str], list[str] | None]] = []
+    if PUBLIC in scopes:
+        lookups.append(([PUBLIC], None))  # only the owner can publish
+    own = [scope for scope in scopes if scope != PUBLIC]
+    if own:
+        lookups.append((own, sorted(trusted)))
+    for visible, authors in lookups:
+        texts = memory.store.texts_with_phrase(list(phrase), scopes=visible,
+                                               asserted_by=authors)
+        if any(_contains(tokenize(text), phrase) for text in texts):
+            return True
+    return False
 
 
 # -- the context pack ----------------------------------------------------------------------
@@ -259,7 +348,7 @@ def build_context(memory: Memory, viewer: Viewer, message: str, *, k: int = 8,
 
 
 def attribution(memory: Memory, fact: Fact) -> str | None:
-    if fact.asserted_by in ("owner", "system", "import"):
+    if fact.asserted_by in OWNER_TAGS:
         return None
     node = memory.store.get_node(fact.asserted_by)
     if node is not None and node.role == "owner":

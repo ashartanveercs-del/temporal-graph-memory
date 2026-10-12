@@ -6,15 +6,19 @@ transaction, and is idempotent: a second run right after the first finds nothing
 Embedding happens afterwards, outside the transaction, so a slow provider never holds the
 database's write lock.
 
-Merging is deliberately narrow. It only touches many-valued predicates (notes, likes),
-only compares facts with the same subject, predicate *and audience* (nothing is ever
-merged across scopes, which would move private text into a shared fact), and keeps the
-most informative wording.
+Merging is deliberately narrow. It only touches many-valued predicates (notes, likes) and
+only compares facts on the same timeline (``Fact.key``). Nothing is ever merged across
+scopes, which would move private text into a shared fact, or between a contact's claims
+and the owner's notes. It keeps the most informative wording, and it never touches a note
+that contains a negation: word overlap cannot tell "allergic to latex gloves" from "not
+allergic to latex gloves", or "needs latex gloves" from "needs latex-free gloves", and
+folding one into the other would erase what was said. Exact duplicates are still folded.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,6 +31,23 @@ if TYPE_CHECKING:
     from .memory import Memory
 
 DEFAULT_MERGE_THRESHOLD = 0.85
+
+# Words that turn a statement around, including contractions typed without an apostrophe
+# ("dont", "cant") and the "non-" / "-free" of "non-latex" and "latex-free".
+NEGATIONS = frozenset({
+    "not", "no", "never", "none", "nobody", "nothing", "nowhere", "neither", "nor",
+    "without", "cannot", "non", "free", "aint", "arent", "cant", "couldnt", "didnt",
+    "doesnt", "dont", "hadnt", "hasnt", "havent", "isnt", "mustnt", "neednt", "shouldnt",
+    "wasnt", "werent", "wont", "wouldnt",
+})
+_CONTRACTED = re.compile(r"n['‘’ʼ]t\b", re.IGNORECASE)  # isn't, don’t, can't, won't
+
+
+def negated(text: str) -> bool:
+    """Whether ``text`` contains a negation, so its words alone do not say what it means."""
+    if _CONTRACTED.search(unicodedata.normalize("NFKC", text)):
+        return True
+    return any(word in NEGATIONS for word in tokenize(text))
 
 
 @dataclass(frozen=True)
@@ -125,9 +146,10 @@ def _fold_duplicates(memory: Memory, facts: list[Fact], now: datetime,
 
 def _merge_similar(memory: Memory, facts: list[Fact], now: datetime,
                    out: list[tuple[str, str]], threshold: float) -> None:
-    """Fold a note into a longer one that says the same thing (or more)."""
-    words = {f.id: frozenset(t for t in tokenize(f.value or "") if t not in STOPWORDS)
-             for f in facts if f.value is not None}
+    """Fold a note into a longer one that says the same thing (or more). Notes with a
+    negation take no part, as either side."""
+    words = {f.id: frozenset(t for t in tokenize(f.value) if t not in STOPWORDS)
+             for f in facts if f.value is not None and not negated(f.value)}
     order = sorted((f for f in facts if f.id in words),
                    key=lambda f: (-len(words[f.id]), f.recorded_at, f.id))
     kept: list[Fact] = []

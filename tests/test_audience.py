@@ -6,6 +6,7 @@ import pytest
 from fakes import MATEO, PRIYA, ROSA
 
 from tgmem.memory import Memory, NotFound, ScopeError
+from tgmem.tools import call_tool
 
 HOUR, DAY = timedelta(hours=1), timedelta(days=1)
 
@@ -160,6 +161,42 @@ def test_the_guard_ignores_phrases_the_viewer_may_see_elsewhere(mem, shop):
     priya = mem.for_sender(PRIYA)
     # "500" is in Mateo's private order, but the shop's public minimum says it too.
     assert priya.guard("Flyers come in batches of 500.") == []
+
+
+def test_a_contact_cannot_whitelist_numbers_by_saving_them_first(mem, shop):
+    mateo = mem.for_sender(MATEO)
+    assert [f.id for f in mateo.guard("Her budget is $480.")] == [shop["budget"].id]
+    every_number = " ".join(str(n) for n in range(100, 1000))
+    planted = call_tool(mateo, "memory_remember", {"predicate": "note", "value": every_number})
+    assert planted["ok"] is True
+    assert [f.id for f in mateo.guard("Her budget is $480.")] == [shop["budget"].id]
+
+
+def test_phrases_the_owner_recorded_for_the_viewer_count_as_known(mem, shop):
+    mem.remember("mateo", "quote", "480 postcards at 10 cents each")  # written by the owner
+    assert mem.for_sender(MATEO).guard("That's 480 postcards, as quoted.") == []
+
+
+@pytest.mark.parametrize(("reply", "fact"), [
+    ("Priya's budget is for wedding invitations.", "budget"),
+    ("The Elm Street Springfield address is on file.", "address"),
+    ("Priya lives on Elm Street.", "address"),
+    ("Ms Shah lives on Elm Street, I believe.", "address"),
+])
+def test_the_guard_catches_fragments_of_a_private_value(mem, shop, reply, fact):
+    shop["address"] = mem.remember("priya", "address", "12 Elm Street Springfield")
+    assert [f.id for f in mem.for_sender(MATEO).guard(reply)] == [shop[fact].id]
+
+
+@pytest.mark.parametrize("reply", [
+    "We print wedding invitations and business cards.",
+    "Our shop is on Elm Street too.",
+    "Your flyers can be ready by June 1.",
+])
+def test_the_guard_ignores_generic_fragments(mem, shop, reply):
+    mem.remember("priya", "address", "12 Elm Street Springfield")
+    mem.for_sender(PRIYA).remember("deadline", "invitations needed by June 1")
+    assert mem.for_sender(MATEO).guard(reply) == []
 
 
 def test_the_owner_has_nothing_to_leak(mem, shop):

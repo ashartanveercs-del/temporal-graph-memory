@@ -6,6 +6,8 @@ from fakes import MATEO, PRIYA, ROSA
 from tgmem.memory import Memory, NotFound, ScopeError
 from tgmem.model import Viewer
 from tgmem.store import HandleConflict
+from tgmem.tools import call_tool
+from tgmem.vault import rebuild_from_vault
 
 
 @pytest.fixture
@@ -81,6 +83,74 @@ def test_a_contact_cannot_overwrite_shared_knowledge(mem, facts):
         "9am-5pm Mon-Sat"]
     assert sorted(f.value for f in mem.for_sender(PRIYA).facts("shop", "opening_hours")) == [
         "9am-5pm Mon-Sat", "closed all week"]
+
+
+def test_a_contact_cannot_overwrite_what_the_owner_recorded_about_them(mem, clock):
+    # Memory poisoning through the contact's own scope: the owner's facts about Priya live
+    # in private:priya, the same scope her own tool calls write to.
+    limit = mem.remember("priya", "credit_limit", "$500 net 30")
+    standing = mem.remember("priya", "account_status", "overdue 3 invoices")
+    clock.advance(hours=1)
+    priya = mem.for_sender(PRIYA)
+    raised = call_tool(priya, "memory_remember",
+                       {"predicate": "credit_limit", "value": "$50000 net 365"})
+    raised_since_2020 = call_tool(priya, "memory_remember",
+                                  {"predicate": "credit_limit", "value": "$50000 net 365",
+                                   "valid_from": "2020-01-01"})
+    backdated = call_tool(priya, "memory_remember",
+                          {"predicate": "account_status", "value": "in good standing",
+                           "valid_from": "2020-01-01"})
+    assert raised["ok"] and raised_since_2020["ok"] and backdated["ok"]
+    # Neither superseded nor corrected ("never true"): the owner's rows stand.
+    assert [mem.fact(f.id).status for f in (limit, standing)] == ["active", "active"]
+    assert sorted((f.value, f.asserted_by) for f in mem.facts("priya", "credit_limit")) == [
+        ("$500 net 30", "owner"), ("$50000 net 365", "priya")]
+    assert ("overdue 3 invoices", "owner") in {
+        (f.value, f.asserted_by) for f in mem.facts("priya", "account_status")}
+    # The assistant still gets the owner's values, and sees the claims as Priya's word.
+    pack = priya.context("what is my credit limit and account status?")
+    assert "credit limit $500 net 30\n" in pack.text + "\n"
+    assert "credit limit $50000 net 365 [according to Priya Shah]" in pack.text
+    assert "account status overdue 3 invoices\n" in pack.text + "\n"
+
+
+def test_a_contacts_notes_never_absorb_the_owners(mem):
+    note = mem.remember("priya", "note", "prefers matte finish")  # written by the owner
+    mem.for_sender(PRIYA).remember("note", "prefers matte finish on cards, letterheads and "
+                                           "everything else she orders")
+    report = mem.consolidate()
+    assert report.merged == [] and report.duplicates == []
+    assert mem.fact(note.id).status == "active"
+
+
+def test_a_contacts_own_claims_still_replace_each_other(mem, clock):
+    priya = mem.for_sender(PRIYA)
+    first = priya.remember("deadline", "invitations needed by June 1")
+    clock.advance(hours=1)
+    priya.remember("deadline", "invitations needed by June 8")
+    assert mem.fact(first.id).status == "superseded"
+    assert [f.value for f in mem.facts("priya", "deadline")] == ["invitations needed by June 8"]
+
+
+def test_the_owner_settles_a_claim_by_retracting_it(mem, clock):
+    claim = mem.for_sender(PRIYA).remember("credit_limit", "$50000 net 365")
+    clock.advance(hours=1)
+    mem.remember("priya", "credit_limit", "$500 net 30")
+    assert mem.fact(claim.id).status == "active"  # an owner write never erases what she said
+    with pytest.raises(ValueError, match="claim"):
+        mem.correct(claim.id, "$5000 net 30")  # it would move the claim into the owner's lane
+    mem.retract(claim.id)
+    assert [f.value for f in mem.facts("priya", "credit_limit")] == ["$500 net 30"]
+
+
+def test_owner_facts_and_claims_side_by_side_survive_the_vault(mem, tmp_path):
+    mem.remember("priya", "credit_limit", "$500 net 30")
+    mem.for_sender(PRIYA).remember("credit_limit", "$50000 net 365")
+    mem.export_vault(tmp_path / "vault")
+    rebuild_from_vault(tmp_path / "vault", tmp_path / "copy.db")
+    copy = Memory.open(tmp_path / "copy.db")
+    assert copy.facts("priya", "credit_limit") == mem.facts("priya", "credit_limit")
+    copy.close()
 
 
 def test_owner_writes_through_a_scoped_view(mem):

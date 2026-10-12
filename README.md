@@ -34,13 +34,13 @@ assistant > Quick correction: earlier I said "9am-5pm Monday to Saturday"; it is
 | **Temporal facts** | Every fact is an edge with a validity interval. A new value supersedes what it overlaps without deleting it: a change keeps the old value for the past, a correction replaces it for all time, and a temporary override (holiday hours) hands the regular value back when it ends. |
 | **Bitemporal reads** | Rows are append-only, so `facts(as_of=T, known_at=K)` answers "what did we believe at K about time T", exactly. |
 | **Audience ledger** | Records which *fact version* each contact was told. The assistant avoids repeating itself, and knows which corrections it owes ("you told Priya 9-5; it's now 10-6"). |
-| **Per-sender scoping** | Facts are `public`, `internal` (owner only) or `private:<contact>`. Scopes are enforced inside every retrieval signal, on writes (contacts can't plant shared facts), along graph traversals, and in error messages. |
+| **Per-sender scoping** | Facts are `public`, `internal` (owner only) or `private:<contact>`. Scopes are enforced inside every retrieval signal, on writes (contacts can't plant shared facts), along graph traversals, and in error messages. What a contact says is kept as their claim and never replaces what the owner recorded, even about them. |
 | **Hybrid retrieval** | FTS5/BM25 keywords + embeddings + one-hop graph expansion, fused with reciprocal-rank fusion. A failing embedder trips a circuit breaker and search degrades to keywords; nothing raises. |
-| **Markdown vault** | One page per node, one line per fact, Obsidian-compatible. Export is byte-for-byte deterministic, and the database rebuilds from the vault (a hand edit included). |
-| **Nightly consolidation** | Expires lapsed facts, folds duplicates, merges near-duplicate notes (never across audiences), and backfills embeddings that failed earlier. Idempotent. |
+| **Markdown vault** | One page per node, one line per fact, Obsidian-compatible. Export is byte-for-byte deterministic, and the database rebuilds from the vault (a hand edit included). A rebuild refuses to undo changes made after the export, and leaves out every fact the database or the vault records as purged. |
+| **Nightly consolidation** | Expires lapsed facts, folds duplicates, merges near-duplicate notes (never across audiences or authors, never a note with a negation), and backfills embeddings that failed earlier. Idempotent. |
 | **LLM tools** | OpenAI-style function tools bound to the verified sender: the model never names a sender, and a hidden fact errors exactly like a missing one. |
-| **Outbound guard** | Checks each reply for distinctive values from facts the recipient may not see, before it is sent. |
-| **Tested offline** | 339 tests, no internet access and no keys. They include a randomized model check of the temporal logic and a test proving that check catches a planted bug. |
+| **Outbound guard** | Checks each reply, before it is sent, for distinctive values, or fragments of them, from facts the recipient may not see. |
+| **Tested offline** | 380 tests, no internet access and no keys. They include a randomized model check of the temporal logic and a test proving that check catches a planted bug. |
 
 ## Architecture
 
@@ -84,9 +84,10 @@ flowchart LR
 ### The parts that are harder than they look
 
 **1. A new value is interval arithmetic, not an UPDATE.** When fact *N* valid over `[s, e)`
-arrives, every believed fact for the same subject, predicate and scope that overlaps it is
-ended. Whatever part of it *N* does not cover is re-recorded as a *remainder* row with the old
-value ([`memory.py`](src/tgmem/memory.py)). That one rule produces the three behaviours a
+arrives, every believed fact on the same timeline (same subject, predicate and scope; a
+contact's own claims get a timeline of their own, see 2) that overlaps it is ended. Whatever
+part of it *N* does not cover is re-recorded as a *remainder* row with the old value
+([`memory.py`](src/tgmem/memory.py)). That one rule produces the three behaviours a
 business needs:
 
 ```text
@@ -110,10 +111,19 @@ the candidate set for vector search, and restrict which relationships the graph 
 traverse. Acme's public payment terms are not found for Mateo through a relation that is
 private to Priya. Writes are scoped too. A contact who says "the shop is closed all week"
 creates a fact private to that contact, so one person cannot poison what everyone else is
-told. Errors are scoped: asking for a hidden fact raises the same `NotFound` with the same
-message as asking for one that doesn't exist. Senders map to viewers by exact match on a
-canonical handle (E.164 or lowercase email). There is no "same last ten digits" matching,
-because two people can share a ten-digit tail under different country codes.
+told. Nor can they rewrite what the owner recorded about them. The owner's facts about Priya
+are private to her as well, so they share her scope, but what she states is kept as her
+claim, on a timeline of its own. "My credit limit is $50,000", even backdated to 2020, never
+supersedes or corrects the owner's "$500 net 30", and consolidation never merges a claim
+with the owner's notes. The assistant sees the claim marked "according to Priya Shah", and
+the owner settles it by retracting it. The outbound guard follows the same rule: a phrase
+counts as already known to the recipient only if it appears in a public fact or one the
+owner recorded for them. Otherwise a customer could save every three-digit number in a note
+and so whitelist all of them. Errors are scoped: asking for a hidden fact raises the same
+`NotFound` with the same message as asking for one that doesn't exist. Senders map to
+viewers by exact match on a canonical handle (E.164 or lowercase email). There is no "same
+last ten digits" matching, because two people can share a ten-digit tail under different
+country codes.
 
 **3. "Already told" is about values, not rows; corrections are computed, not stored.** After a
 change is scheduled, today's value lives in a new remainder row, and consolidation may fold
@@ -132,9 +142,15 @@ Export → rebuild → export is byte-identical, and CI checks that on Linux and
 parser is strict and reports `file:line`. It checks dangling references, cross-person
 disclosures and overlapping single-valued facts before touching the database. Rebuild builds
 a fresh file next to the old one and swaps it in. It deletes the old `-wal`/`-shm` files,
-since SQLite would replay a stale WAL into the new database. It refuses to drop facts the
-vault doesn't have unless forced, and carries cached embeddings over so unchanged text isn't
-paid for twice.
+since SQLite would replay a stale WAL into the new database. Export stamps `index.md` with a
+SHA-256 of the canonical rendering of the database (`db-digest`). If the database still
+matches it, the rebuild goes ahead and applies any hand edits. Otherwise it refuses, unless
+forced, as soon as the database holds anything the vault lacks or shows differently: a
+retraction, a new contact, a disclosure, a renamed node. Purged fact ids are kept as
+tombstones in the database and in the vault, and every rebuild, forced or not, leaves them
+out, so rebuilding from an older vault can't bring an erased value back into a database that
+recorded the purge. Cached embeddings are carried over so unchanged text isn't paid for
+twice.
 
 **5. Degradation is designed in.** Embedding happens after the write commits, never while
 holding the write lock, and a failure leaves the fact keyword-searchable and marked pending.
@@ -292,7 +308,7 @@ Environment variables (or `tgmem --env-file .env`; see [`.env.example`](.env.exa
 ## Testing
 
 ```bash
-pytest                            # 339 tests, about 10 s, offline
+pytest                            # 380 tests, about 10 s, offline
 ruff check src tests examples
 ```
 
@@ -323,8 +339,8 @@ embedder:
 | Bulk insert + embed 10,000 facts | ~4 s |
 | Search as a contact (hybrid) | p50 8 ms, p95 15 ms |
 | Search as the owner (all 10,000 facts are candidates) | p50 ~44 ms |
-| Leak check per reply | 0.1 ms; ~80 ms for the first check after a write (index rebuild) |
-| Vault export / rebuild | ~0.9 s / ~4 s (cached embeddings carried over) |
+| Leak check per reply | 0.1 ms; ~160 ms for the first check after a write (index rebuild) |
+| Vault export / rebuild | ~0.9 s / ~5 s (cached embeddings carried over; the old database is checked first) |
 
 Vector search is exact brute force over the candidates a viewer may see. That's comfortable
 up to tens of thousands of facts per assistant; beyond that, see the roadmap.
@@ -335,17 +351,25 @@ up to tens of thousands of facts per assistant; beyond that, see the roadmap.
   `for_sender()` trusts the handle you give it. Hand the model a `ScopedMemory`, never the
   `Memory`.
 - An unrecognized or malformed sender gets the anonymous view: public facts only, no writes.
-- Contacts can only write facts private to themselves. Only the owner creates public or
-  internal knowledge.
-- The leak guard is a backstop, not the boundary. It matches distinctive values (multi-word
-  phrases, long words, numbers with three or more digits) deterministically. A one-word value
-  such as "matte" or a two-digit number is not detected. The boundary is retrieval-time
-  scoping, which decides what the model ever sees.
+- Contacts can only write facts private to themselves, and those are kept as their claims:
+  they never supersede, correct or merge with what the owner recorded, including the owner's
+  facts about that contact. Only the owner creates public or internal knowledge.
+- The leak guard is a backstop, not the boundary. It matches deterministically: a hidden
+  value's opening phrase, its numbers with three or more digits, any three-word run of it
+  holding at least two words that are not stopwords and have three or more characters ("for
+  wedding invitations"), and, for a fact about a person, two such words in a row when the
+  reply also names that person ("Priya lives on Elm Street"). A one-word value such as
+  "matte", a two-digit number, a two-word fragment without the person's name, or a paraphrase
+  is not detected. A phrase counts as already known to the recipient only if it appears in a
+  public fact or one the owner recorded for them, never in text the recipient wrote. The
+  boundary is retrieval-time scoping, which decides what the model ever sees.
 - The database and the vault contain everything, including private facts and phone numbers.
   Protect them like any database: file permissions, encryption at rest, backup policy.
 - `retract()` keeps history. `purge()` erases a value from the database, the keyword index,
-  the embedding cache and the audience ledger, but copies in older vault exports or backups
-  (for example a vault kept in git) have to be handled separately.
+  the embedding cache and the audience ledger. It keeps the erased fact ids (never the
+  values) as tombstones, so a rebuild from an older vault leaves them out. The value itself
+  still sits in older vault exports and backups (for example a vault kept in git), which
+  have to be handled separately.
 - API keys never appear in exceptions, reprs or tool errors (tested), and unexpected internal
   errors reach the model only as `"internal error"`.
 

@@ -1,6 +1,7 @@
 """The GraphStore contract. Any backend must pass this suite; it runs against SQLite with
 FTS5 and against SQLite's LIKE fallback (what you get on a build without FTS5)."""
 
+import sqlite3
 from datetime import timedelta
 
 import numpy as np
@@ -327,8 +328,8 @@ def test_fact_values_is_a_narrow_scan_of_every_fact(store):
     store.insert_fact(make_fact("f-1", value="9am-5pm"))
     store.insert_fact(make_fact("f-2", predicate="p2", value=None, object="priya",
                                 scope=private_scope("mateo"), status=CORRECTED, ended_at=T0))
-    assert sorted(store.fact_values()) == [("f-1", PUBLIC, "9am-5pm", None),
-                                           ("f-2", "private:mateo", None, "priya")]
+    assert sorted(store.fact_values()) == [("f-1", "shop", PUBLIC, "9am-5pm", None),
+                                           ("f-2", "shop", "private:mateo", None, "priya")]
 
 
 def test_texts_with_phrase_respects_scope(store):
@@ -341,3 +342,42 @@ def test_texts_with_phrase_respects_scope(store):
         "minimum order is 500 flyers", "secret 500 flyers due"]
     assert store.texts_with_phrase(["flyers", "500"], scopes=(PUBLIC,)) in ([], [
         "minimum order is 500 flyers"])  # word order is checked by the caller
+
+
+def test_texts_with_phrase_can_be_limited_to_some_authors(store):
+    store.insert_fact(make_fact("f-1", text="minimum order is 500 flyers"))
+    store.insert_fact(make_fact("f-2", subject="priya", predicate="note", value="x",
+                                scope=private_scope("priya"), asserted_by="priya",
+                                text="Priya Shah note 500 flyers"))
+    found = store.texts_with_phrase(["500", "flyers"], scopes=None, asserted_by=["owner"])
+    assert found == ["minimum order is 500 flyers"]
+    assert store.texts_with_phrase(["500", "flyers"], scopes=None, asserted_by=[]) == []
+
+
+def test_purged_ids_are_kept_and_never_stored_again(store):
+    store.insert_fact(make_fact("f-1"))
+    assert store.purged_ids() == []
+    with store.transaction():
+        store.delete_fact("f-1")
+        store.add_purged(["f-1"])
+    store.add_purged(["f-1"])  # recording the same purge twice is harmless
+    assert store.purged_ids() == ["f-1"]
+    with pytest.raises(ValueError, match="purged"):
+        store.insert_fact(make_fact("f-1"))
+
+
+def test_a_read_only_store_reads_but_never_writes(tmp_path):
+    path = tmp_path / "memory.db"
+    writer = SQLiteGraphStore(path)
+    seed_nodes(writer)
+    writer.insert_fact(make_fact("f-1"))
+    writer.close()
+    reader = SQLiteGraphStore(path, readonly=True)
+    try:
+        assert [f.id for f in reader.query_facts()] == ["f-1"]
+        assert [n.id for n in reader.nodes()] == ["mateo", "priya", "shop"]
+        assert reader.purged_ids() == []
+        with pytest.raises(sqlite3.OperationalError):
+            reader.put_predicate("note", "many")
+    finally:
+        reader.close()

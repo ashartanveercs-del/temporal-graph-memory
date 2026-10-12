@@ -75,8 +75,14 @@ def test_believed_statuses():
     assert not make_fact(status=CORRECTED).believed
 
 
-def test_fact_key_groups_by_subject_predicate_and_scope():
-    assert make_fact().key == ("shop", "opening_hours", PUBLIC)
+def test_fact_key_groups_by_subject_predicate_scope_and_claimant():
+    assert make_fact().key == ("shop", "opening_hours", PUBLIC, None)
+    claim = make_fact(subject="priya", scope="private:priya", asserted_by="priya")
+    assert claim.claimant == "priya"
+    assert claim.key == ("priya", "opening_hours", "private:priya", "priya")
+    assert make_fact(subject="priya", scope="private:priya").claimant is None  # the owner's
+    assert make_fact(scope="private:priya", asserted_by="mateo").claimant is None
+    assert make_fact(asserted_by="priya").claimant is None  # public: only the owner publishes
 
 
 def test_fact_rejects_value_and_object_together_or_neither():

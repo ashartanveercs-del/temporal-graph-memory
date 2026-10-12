@@ -155,7 +155,8 @@ _TOOLS = (
     _Tool("memory_search", "Search what you know that you may share with this person.",
           ("owner", "contact", "anonymous"), _search, _search_params),
     _Tool("memory_remember", "Save a fact for later. Facts a contact tells you are kept "
-          "private to them.", ("owner", "contact"), _remember, _remember_params),
+          "private to them, as their own claim.", ("owner", "contact"), _remember,
+          _remember_params),
     _Tool("memory_mark_told", "Record which facts you just told this person, so you do not "
           "repeat them.", ("contact",), _mark_told, _ids_params),
     _Tool("memory_corrections", "List things this person was told that are no longer true.",

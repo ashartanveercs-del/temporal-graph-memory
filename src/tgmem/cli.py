@@ -287,9 +287,11 @@ def cmd_vault(ctx: _Context) -> int:
               f"{len(data.disclosures)} disclosures", file=ctx.out)
     else:
         report = rebuild_from_vault(vault_dir, ctx.settings.db_path, force=ctx.args.force)
+        left_out = (f", {report.purged_left_out} purged fact(s) left out"
+                    if report.purged_left_out else "")
         print(f"rebuilt {ctx.settings.db_path}: {report.nodes} nodes, {report.facts} facts, "
               f"{report.disclosures} disclosures, {report.embeddings_kept} cached "
-              "embeddings kept", file=ctx.out)
+              f"embeddings kept{left_out}", file=ctx.out)
     return 0
 
 
@@ -386,7 +388,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = command("vault", cmd_vault, "export, check or rebuild from the Markdown vault")
     p.add_argument("action", choices=["export", "check", "rebuild"])
     p.add_argument("--force", action="store_true",
-                   help="rebuild even if the database has facts the vault lacks")
+                   help="rebuild even if the database has changed since the export "
+                        "(those changes are discarded; purged facts stay purged)")
     return parser
 
 
