@@ -1,0 +1,13 @@
+# Lakeside Print Shop: a scripted day of messages. Run it with
+#   python examples/chat_loop.py --script examples/demo_script.txt
+priya: Hi! What are your opening hours?
+priya: Sorry, what were the opening hours again?
+mateo: What budget did Priya Shah give you?
+mateo: When is my order due?
+rosa: remember shop opening_hours = 10am-6pm Monday to Saturday
+/wait 1d
+priya: Thanks! Do you do letterpress?
+priya: remember deadline = invitations needed by June 1
++1 555 000 0199: Are you open on Saturday?
+/consolidate
+/vault

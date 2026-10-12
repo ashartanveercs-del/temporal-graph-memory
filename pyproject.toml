@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "temporal-graph-memory"
+version = "0.1.0"
+description = "Long-term memory for AI assistants: a temporal knowledge graph with superseded facts, audience tracking, a Markdown vault mirror, per-sender scoping and hybrid retrieval."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Ashar Tanveer" }]
+keywords = ["llm-memory", "knowledge-graph", "temporal-database", "bitemporal", "rag", "sqlite", "fts5", "embeddings", "ai-agents"]
+dependencies = [
+    "numpy>=1.26",
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+tgmem = "tgmem.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tgmem"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
