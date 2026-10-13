@@ -1,17 +1,29 @@
 # temporal-graph-memory
 
-**Long-term memory for an AI assistant that talks to many people.** It remembers facts as a
-temporal knowledge graph (what was true when, and what the assistant believed when). It
-tracks what each person has already been told, never hands one person another person's
-private facts, mirrors everything to a Markdown vault you can read, diff and rebuild from,
-and keeps searching (keywords + graph) when the embedding provider is down.
+**Bitemporal memory for assistants that need to remember both facts and conversations.**
+Track what was true, what was believed at the time, and which version each person was told.
+A SQLite graph combines scoped hybrid retrieval, attributed customer claims and a rebuildable
+Markdown vault. Embedding outages leave keyword and graph retrieval available.
 
+[![CI](https://github.com/ashartanveercs-del/temporal-graph-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/ashartanveercs-del/temporal-graph-memory/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
-![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Dependencies](https://img.shields.io/badge/runtime%20deps-numpy%2C%20tzdata-lightgrey)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-A day at a fictional print shop, run by [`examples/chat_loop.py`](examples/chat_loop.py)
-(the replies are composed from memory alone, no LLM involved):
+[Quick start](#quick-start) | [Architecture](#architecture) | [Design decisions](#the-parts-that-are-harder-than-they-look) | [Verification & proof map](docs/VERIFICATION.md) | [Security boundaries](#security-notes)
+
+- **Two clocks, one history:** interval overrides preserve past values; `known_at` reconstructs past belief. An independent randomized model checks the semantics and detects a deliberately planted bug.
+- **Scope before ranking:** keyword, vector and graph candidates are filtered for the verified sender. Customer claims have separate timelines from owner facts.
+- **Recovery you can inspect:** deterministic Markdown exports round-trip byte for byte; rebuilds detect stale exports and retain purge tombstones.
+
+## Try it offline
+
+```bash
+python -m pip install -e ".[dev]"
+python examples/chat_loop.py --script examples/demo_script.txt
+```
+
+No API key or model is needed. The demo uses a temporary database and vault. In this fictional
+print-shop conversation, an earlier answer becomes a correction owed to the same customer:
 
 ```text
 priya > Hi! What are your opening hours?
@@ -32,10 +44,10 @@ assistant > Quick correction: earlier I said "9am-5pm Monday to Saturday"; it is
 | | |
 |---|---|
 | **Temporal facts** | Every fact is an edge with a validity interval. A new value supersedes what it overlaps without deleting it: a change keeps the old value for the past, a correction replaces it for all time, and a temporary override (holiday hours) hands the regular value back when it ends. |
-| **Bitemporal reads** | Rows are append-only, so `facts(as_of=T, known_at=K)` answers "what did we believe at K about time T", exactly. |
+| **Bitemporal reads** | Versioned history lets `facts(as_of=T, known_at=K)` answer "what did we believe at K about time T". |
 | **Audience ledger** | Records which *fact version* each contact was told. The assistant avoids repeating itself, and knows which corrections it owes ("you told Priya 9-5; it's now 10-6"). |
 | **Per-sender scoping** | Facts are `public`, `internal` (owner only) or `private:<contact>`. Scopes are enforced inside every retrieval signal, on writes (contacts can't plant shared facts), along graph traversals, and in error messages. What a contact says is kept as their claim and never replaces what the owner recorded, even about them. |
-| **Hybrid retrieval** | FTS5/BM25 keywords + embeddings + one-hop graph expansion, fused with reciprocal-rank fusion. A failing embedder trips a circuit breaker and search degrades to keywords; nothing raises. |
+| **Hybrid retrieval** | FTS5/BM25 keywords + embeddings + one-hop graph expansion, fused with reciprocal-rank fusion. A failing embedder trips a circuit breaker and search degrades to keywords with failure metadata. |
 | **Markdown vault** | One page per node, one line per fact, Obsidian-compatible. Export is byte-for-byte deterministic, and the database rebuilds from the vault (a hand edit included). A rebuild refuses to undo changes made after the export, and leaves out every fact the database or the vault records as purged. |
 | **Nightly consolidation** | Expires lapsed facts, folds duplicates, merges near-duplicate notes (never across audiences or authors, never a note with a negation), and backfills embeddings that failed earlier. Idempotent. |
 | **LLM tools** | OpenAI-style function tools bound to the verified sender: the model never names a sender, and a hidden fact errors exactly like a missing one. |
@@ -308,7 +320,7 @@ Environment variables (or `tgmem --env-file .env`; see [`.env.example`](.env.exa
 ## Testing
 
 ```bash
-pytest                            # 380 tests, about 10 s, offline
+python -m pytest -q -ra            # 380 passed in the dated local verification
 ruff check src tests examples
 ```
 
@@ -331,8 +343,9 @@ ruff check src tests examples
 
 ### Performance
 
-Measured on a laptop with 10,000 facts across 1,000 contacts and the 256-dimension hashing
-embedder:
+Historical development measurements on a laptop with 10,000 facts across 1,000 contacts
+and the 256-dimension hashing embedder (hardware was not recorded; these figures were not
+rerun in the [2026-10-12 verification](docs/VERIFICATION.md) and are indicative, not a performance SLA):
 
 | Operation | Time |
 |---|---|
