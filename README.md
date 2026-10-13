@@ -394,6 +394,11 @@ up to tens of thousands of facts per assistant; beyond that, see the roadmap.
 - LLM-assisted fact extraction from conversations, subject to the same write scoping
 - Encryption at rest for the database and the vault
 
+## Secret scanning
+
+[Full-history audit and secret-scan CI](docs/SECURITY-AUDIT.md). Configuration examples and
+synthetic fixtures were reviewed before publication; new credential findings fail the gate.
+
 ## License
 
 MIT
